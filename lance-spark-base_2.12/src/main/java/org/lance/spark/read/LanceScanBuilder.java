@@ -67,6 +67,10 @@ public class LanceScanBuilder
   private static final Logger LOG = LoggerFactory.getLogger(LanceScanBuilder.class);
 
   private final LanceSparkReadOptions readOptions;
+
+  /** Full table schema before column pruning; used to widen nested structs for vectorized reads. */
+  private final StructType fullTableSchema;
+
   private StructType schema;
 
   private Filter[] pushedFilters = new Filter[0];
@@ -101,6 +105,7 @@ public class LanceScanBuilder
       String namespaceImpl,
       java.util.Map<String, String> namespaceProperties,
       java.util.Map<String, String> tableProperties) {
+    this.fullTableSchema = schema;
     this.schema = schema;
     this.readOptions = readOptions;
     this.initialStorageOptions = initialStorageOptions;
@@ -231,7 +236,8 @@ public class LanceScanBuilder
 
   @Override
   public void pruneColumns(StructType requiredSchema) {
-    this.schema = requiredSchema;
+    this.schema =
+        ReadSchemaNestedStructWidening.widenRequiredSchema(requiredSchema, fullTableSchema);
   }
 
   @Override
