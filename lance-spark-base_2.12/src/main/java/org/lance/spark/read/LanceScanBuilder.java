@@ -16,10 +16,12 @@ package org.lance.spark.read;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.ManifestSummary;
+import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.scalar.ZoneStats;
 import org.lance.ipc.ColumnOrdering;
 import org.lance.schema.LanceField;
+import org.lance.spark.LanceConstant;
 import org.lance.spark.LanceSparkReadOptions;
 import org.lance.spark.utils.Optional;
 import org.lance.spark.utils.Utils;
@@ -41,9 +43,7 @@ import org.apache.spark.sql.connector.read.SupportsPushDownOffset;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.connector.read.SupportsPushDownTopN;
 import org.apache.spark.sql.sources.Filter;
-import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataTypes;
-import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -69,7 +69,7 @@ public class LanceScanBuilder
   private final LanceSparkReadOptions readOptions;
 
   /** Full table schema before column pruning; used to widen nested structs for vectorized reads. */
-  private final StructType fullTableSchema;
+  private final StructType fullSchema;
 
   private StructType schema;
 
@@ -96,8 +96,6 @@ public class LanceScanBuilder
 
   private final java.util.Map<String, String> tableProperties;
 
-  static final String TABLE_OPT_PARTITION_COLUMNS = "lance.partition.columns";
-
   public LanceScanBuilder(
       StructType schema,
       LanceSparkReadOptions readOptions,
@@ -105,7 +103,7 @@ public class LanceScanBuilder
       String namespaceImpl,
       java.util.Map<String, String> namespaceProperties,
       java.util.Map<String, String> tableProperties) {
-    this.fullTableSchema = schema;
+    this.fullSchema = schema;
     this.schema = schema;
     this.readOptions = readOptions;
     this.initialStorageOptions = initialStorageOptions;
@@ -146,7 +144,7 @@ public class LanceScanBuilder
 
     // Collect all columns that need zonemap stats: filter columns + partition column (if declared).
     Set<String> columnsToLoad = extractReferencedColumns(pushedFilters);
-    String partitionColumn = tableProperties.get(TABLE_OPT_PARTITION_COLUMNS);
+    String partitionColumn = tableProperties.get(LanceConstant.TABLE_OPT_PARTITION_COLUMNS);
     if (partitionColumn != null && !partitionColumn.trim().isEmpty()) {
       partitionColumn = partitionColumn.trim();
       columnsToLoad.add(partitionColumn);
@@ -167,7 +165,7 @@ public class LanceScanBuilder
             "Partition column '{}' declared in {} has no zonemap index or stats;"
                 + " partition detection disabled",
             partitionColumn,
-            TABLE_OPT_PARTITION_COLUMNS);
+            LanceConstant.TABLE_OPT_PARTITION_COLUMNS);
       } else {
         Map<Integer, Comparable<?>> partValues =
             ZonemapFragmentPruner.computeFragmentPartitionValues(zonemapStats.get(partitionColumn))
@@ -191,16 +189,21 @@ public class LanceScanBuilder
           ZonemapFragmentPruner.pruneFragments(pushedFilters, zonemapStats).orElse(null);
     }
 
-    LanceStatistics statistics;
+    // Scale rows and full size by the zonemap fragment-pruning ratio first, then let
+    // LanceStatistics.estimateProjected apply the column-width ratio on top
+    // (when the projected schema is narrower than the full schema).
+    long projectedRows = summary.getTotalRows();
+    long projectedFullSize = summary.getTotalFilesSize();
+    if (survivingFragmentIds != null && summary.getTotalFragments() > 0) {
+      double ratio = (double) survivingFragmentIds.size() / summary.getTotalFragments();
+      projectedRows = (long) (projectedRows * ratio);
+      projectedFullSize = (long) (projectedFullSize * ratio);
+    }
+    LanceStatistics statistics =
+        LanceStatistics.estimateProjected(projectedRows, projectedFullSize, fullSchema, schema);
     if (survivingFragmentIds != null) {
-      statistics =
-          LanceStatistics.estimatePostPruning(
-              summary.getTotalRows(),
-              summary.getTotalFilesSize(),
-              summary.getTotalFragments(),
-              survivingFragmentIds.size());
       LOG.debug(
-          "Estimated post-pruning statistics: {} of {} fragments survive,"
+          "Scan statistics after pruning: {} of {} fragments survive,"
               + " estimatedSize={}, estimatedRows={} (full: size={}, rows={})",
           survivingFragmentIds.size(),
           summary.getTotalFragments(),
@@ -208,8 +211,6 @@ public class LanceScanBuilder
           statistics.numRows(),
           summary.getTotalFilesSize(),
           summary.getTotalRows());
-    } else {
-      statistics = new LanceStatistics(summary);
     }
 
     // Close the lazily opened dataset - it's no longer needed after build
@@ -236,27 +237,12 @@ public class LanceScanBuilder
 
   @Override
   public void pruneColumns(StructType requiredSchema) {
-    this.schema =
-        ReadSchemaNestedStructWidening.widenRequiredSchema(requiredSchema, fullTableSchema);
+    this.schema = ReadSchemaNestedStructWidening.widenRequiredSchema(requiredSchema, fullSchema);
   }
 
   @Override
   public Filter[] pushFilters(Filter[] filters) {
     if (!readOptions.isPushDownFilters()) {
-      return filters;
-    }
-    // remove the code after fix this issue https://github.com/lance-format/lance/issues/3578
-    boolean hasNestedField = false;
-    for (StructField field : this.schema.fields()) {
-      if (field.dataType() instanceof ArrayType) {
-        ArrayType fieldType = (ArrayType) field.dataType();
-        if (fieldType.elementType() instanceof StructType) {
-          hasNestedField = true;
-          break;
-        }
-      }
-    }
-    if (hasNestedField) {
       return filters;
     }
     Filter[][] processFilters = FilterPushDown.processFilters(filters);
@@ -399,7 +385,10 @@ public class LanceScanBuilder
         fieldIdToName.put(field.getId(), field.getName());
       }
 
-      for (IndexDescription idx : dataset.describeIndices()) {
+      // Use the criteria-based overload so that indexes missing index_details
+      // (created by older versions) are silently skipped instead of causing errors.
+      IndexCriteria criteria = new IndexCriteria.Builder().build();
+      for (IndexDescription idx : dataset.describeIndices(criteria)) {
         if ("ZONEMAP".equalsIgnoreCase(idx.getIndexType())) {
           for (int fieldId : idx.getFieldIds()) {
             String name = fieldIdToName.get(fieldId);
